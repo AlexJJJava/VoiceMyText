@@ -107,7 +107,7 @@ app.post('/tts', async (c) => {
     if (chunks.length === 0) return c.json({ error: 'Nessun audio generato' }, 500)
 
     const audioBuffer = Buffer.concat(chunks)
-
+ 
     return new Response(audioBuffer, {
       status: 200,
       headers: {
