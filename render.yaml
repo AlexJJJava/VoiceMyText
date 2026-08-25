@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: voicemytext
+    env: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    plan: free
