@@ -2,6 +2,8 @@ import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { cors } from 'hono/cors'
 import { Communicate } from 'edge-tts-universal'
+import { createClient } from '@supabase/supabase-js'
+import { randomUUID } from 'node:crypto'
 
 const app = new Hono()
 
@@ -9,7 +11,32 @@ const app = new Hono()
 // a quel dominio. Senza impostarla (es. in sviluppo locale) resta aperta a '*'.
 const allowedOrigin = process.env.ALLOWED_ORIGIN || '*'
 
-app.use('*', cors({ origin: allowedOrigin }))
+app.use(
+  '*',
+  cors({
+    origin: allowedOrigin,
+    allowHeaders: ['Content-Type', 'Authorization'],
+  })
+)
+
+// La anon key è pensata per essere pubblica: la sicurezza è garantita dalle
+// Row Level Security policy di Supabase, non dalla segretezza di questa chiave.
+const SUPABASE_URL = 'https://fmgdismlokadyzdzambh.supabase.co'
+const SUPABASE_ANON_KEY =
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZtZ2Rpc21sb2thZHl6ZHphbWJoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc3Mjk5OTgsImV4cCI6MjEwMzMwNTk5OH0.bCzCUPAkfQlEZcbn_dQ8ZJBwvcvZ8bC9N7jl_GKYWfI'
+
+const MAX_LIBRARY_ITEMS = 2
+
+// Crea un client Supabase "impersonato" con il token dell'utente che ha
+// fatto la richiesta: tutte le operazioni rispettano le Row Level Security
+// policy configurate nel database (ogni utente vede/modifica solo i propri
+// dati), senza bisogno di usare la service_role key sul backend.
+function getUserSupabaseClient(accessToken: string) {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    global: { headers: { Authorization: `Bearer ${accessToken}` } },
+    auth: { persistSession: false },
+  })
+}
 
 const VOICES: Record<string, string> = {
   isabella: 'it-IT-IsabellaNeural',
@@ -107,7 +134,7 @@ app.post('/tts', async (c) => {
     if (chunks.length === 0) return c.json({ error: 'Nessun audio generato' }, 500)
 
     const audioBuffer = Buffer.concat(chunks)
- 
+
     return new Response(audioBuffer, {
       status: 200,
       headers: {
@@ -121,6 +148,97 @@ app.post('/tts', async (c) => {
     console.error('Errore TTS:', err)
     return c.json({ error: 'Errore generazione audio' }, 500)
   }
+})
+
+// ── Salvataggio in libreria (max 2 audiolibri per utente) ──────────
+// Riceve l'audio già generato (dall'anteprima /tts) insieme ai metadati,
+// verifica il limite e lo carica su Supabase Storage + database.
+app.post('/library', async (c) => {
+  const authHeader = c.req.header('authorization') ?? c.req.header('Authorization')
+  const accessToken = authHeader?.replace(/^Bearer\s+/i, '')
+
+  if (!accessToken) {
+    return c.json({ error: 'Autenticazione richiesta' }, 401)
+  }
+
+  const supabase = getUserSupabaseClient(accessToken)
+
+  const { data: userData, error: userError } = await supabase.auth.getUser()
+  if (userError || !userData?.user) {
+    return c.json({ error: 'Sessione non valida, effettua di nuovo il login' }, 401)
+  }
+  const userId = userData.user.id
+
+  // Conta gli audiolibri già salvati da questo utente (RLS filtra
+  // automaticamente solo le sue righe)
+  const { count, error: countError } = await supabase
+    .from('audiobooks')
+    .select('id', { count: 'exact', head: true })
+
+  if (countError) {
+    console.error('Errore conteggio libreria:', countError)
+    return c.json({ error: 'Errore nel controllo della libreria' }, 500)
+  }
+
+  if ((count ?? 0) >= MAX_LIBRARY_ITEMS) {
+    return c.json(
+      { error: `Limite di ${MAX_LIBRARY_ITEMS} audiolibri raggiunto. Elimina un audiolibro per salvarne uno nuovo.` },
+      403
+    )
+  }
+
+  let body: Record<string, unknown>
+  try {
+    body = await c.req.parseBody()
+  } catch {
+    return c.json({ error: 'Richiesta non valida' }, 400)
+  }
+
+  const title = typeof body.title === 'string' ? body.title.trim() : ''
+  const originalText = typeof body.original_text === 'string' ? body.original_text.trim() : ''
+  const voice = typeof body.voice === 'string' ? body.voice : ''
+  const audioFile = body.audio
+
+  if (!title) return c.json({ error: 'Titolo obbligatorio' }, 400)
+  if (title.length > 200) return c.json({ error: 'Titolo troppo lungo' }, 400)
+  if (!originalText) return c.json({ error: 'Testo mancante' }, 400)
+  if (!VOICES[voice]) return c.json({ error: 'Voce non valida' }, 400)
+  if (!(audioFile instanceof File)) {
+    return c.json({ error: 'File audio mancante' }, 400)
+  }
+
+  const audioBuffer = Buffer.from(await audioFile.arrayBuffer())
+  const filePath = `${userId}/${randomUUID()}.mp3`
+
+  const { error: uploadError } = await supabase.storage
+    .from('audiobooks')
+    .upload(filePath, audioBuffer, { contentType: 'audio/mpeg' })
+
+  if (uploadError) {
+    console.error('Errore upload storage:', uploadError)
+    return c.json({ error: 'Errore nel salvataggio del file audio' }, 500)
+  }
+
+  const { data: inserted, error: insertError } = await supabase
+    .from('audiobooks')
+    .insert({
+      user_id: userId,
+      title,
+      original_text: originalText,
+      voice,
+      audio_path: filePath,
+    })
+    .select()
+    .single()
+
+  if (insertError) {
+    console.error('Errore inserimento libreria:', insertError)
+    // Ripulisce il file caricato se l'inserimento nel database fallisce
+    await supabase.storage.from('audiobooks').remove([filePath])
+    return c.json({ error: 'Errore nel salvataggio in libreria' }, 500)
+  }
+
+  return c.json({ audiobook: inserted }, 201)
 })
 
 const port = Number(process.env.PORT) || 3000
