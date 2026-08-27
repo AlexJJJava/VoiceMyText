@@ -163,84 +163,86 @@ app.post('/library', async (c) => {
 
   const supabase = getUserSupabaseClient(accessToken)
 
-  const { data: userData, error: userError } = await supabase.auth.getUser()
-  if (userError || !userData?.user) {
-    return c.json({ error: 'Sessione non valida, effettua di nuovo il login' }, 401)
-  }
-  const userId = userData.user.id
-
-  // Conta gli audiolibri già salvati da questo utente (RLS filtra
-  // automaticamente solo le sue righe)
-  const { count, error: countError } = await supabase
-    .from('audiobooks')
-    .select('id', { count: 'exact', head: true })
-
-  if (countError) {
-    console.error('Errore conteggio libreria:', countError)
-    return c.json({ error: 'Errore nel controllo della libreria' }, 500)
-  }
-
-  if ((count ?? 0) >= MAX_LIBRARY_ITEMS) {
-    return c.json(
-      { error: `Limite di ${MAX_LIBRARY_ITEMS} audiolibri raggiunto. Elimina un audiolibro per salvarne uno nuovo.` },
-      403
-    )
-  }
-
-  let body: Record<string, unknown>
   try {
-    body = await c.req.parseBody()
-  } catch {
-    return c.json({ error: 'Richiesta non valida' }, 400)
+    const { data: userData, error: userError } = await supabase.auth.getUser()
+    if (userError || !userData?.user) {
+      return c.json({ error: 'Sessione non valida, effettua di nuovo il login' }, 401)
+    }
+    const userId = userData.user.id
+
+    // Conta gli audiolibri già salvati da questo utente (RLS filtra
+    // automaticamente solo le sue righe)
+    const { count, error: countError } = await supabase
+      .from('audiobooks')
+      .select('id', { count: 'exact', head: true })
+
+    if (countError) {
+      console.error('Errore conteggio libreria:', countError)
+      return c.json({ error: 'Errore nel controllo della libreria' }, 500)
+    }
+
+    if ((count ?? 0) >= MAX_LIBRARY_ITEMS) {
+      return c.json(
+        { error: `Limite di ${MAX_LIBRARY_ITEMS} audiolibri raggiunto. Elimina un audiolibro per salvarne uno nuovo.` },
+        403
+      )
+    }
+
+    const body = await c.req.parseBody()
+
+    const title = typeof body.title === 'string' ? body.title.trim() : ''
+    const originalText = typeof body.original_text === 'string' ? body.original_text.trim() : ''
+    const voice = typeof body.voice === 'string' ? body.voice : ''
+    const audioFile = body.audio
+
+    if (!title) return c.json({ error: 'Titolo obbligatorio' }, 400)
+    if (title.length > 200) return c.json({ error: 'Titolo troppo lungo' }, 400)
+    if (!originalText) return c.json({ error: 'Testo mancante' }, 400)
+    if (!VOICES[voice]) return c.json({ error: 'Voce non valida' }, 400)
+    if (!(audioFile instanceof File)) {
+      return c.json({ error: 'File audio mancante' }, 400)
+    }
+
+    const audioBuffer = Buffer.from(await audioFile.arrayBuffer())
+    const filePath = `${userId}/${randomUUID()}.mp3`
+
+    const { error: uploadError } = await supabase.storage
+      .from('audiobooks')
+      .upload(filePath, audioBuffer, { contentType: 'audio/mpeg' })
+
+    if (uploadError) {
+      console.error('Errore upload storage:', uploadError)
+      return c.json({ error: 'Errore nel salvataggio del file audio' }, 500)
+    }
+
+    const { data: inserted, error: insertError } = await supabase
+      .from('audiobooks')
+      .insert({
+        user_id: userId,
+        title,
+        original_text: originalText,
+        voice,
+        audio_path: filePath,
+      })
+      .select()
+      .single()
+
+    if (insertError) {
+      console.error('Errore inserimento libreria:', insertError)
+      // Ripulisce il file caricato se l'inserimento nel database fallisce
+      await supabase.storage.from('audiobooks').remove([filePath])
+      return c.json({ error: 'Errore nel salvataggio in libreria' }, 500)
+    }
+
+    return c.json({ audiobook: inserted }, 201)
+  } catch (err) {
+    // Rete di sicurezza: qualunque errore imprevisto viene loggato per
+    // intero (visibile nei log di Render) e restituito come JSON valido,
+    // invece di lasciar "trapelare" una risposta non gestita al client.
+    console.error('Errore imprevisto in /library:', err)
+    return c.json({ error: 'Errore interno del server' }, 500)
   }
-
-  const title = typeof body.title === 'string' ? body.title.trim() : ''
-  const originalText = typeof body.original_text === 'string' ? body.original_text.trim() : ''
-  const voice = typeof body.voice === 'string' ? body.voice : ''
-  const audioFile = body.audio
-
-  if (!title) return c.json({ error: 'Titolo obbligatorio' }, 400)
-  if (title.length > 200) return c.json({ error: 'Titolo troppo lungo' }, 400)
-  if (!originalText) return c.json({ error: 'Testo mancante' }, 400)
-  if (!VOICES[voice]) return c.json({ error: 'Voce non valida' }, 400)
-  if (!(audioFile instanceof File)) {
-    return c.json({ error: 'File audio mancante' }, 400)
-  }
-
-  const audioBuffer = Buffer.from(await audioFile.arrayBuffer())
-  const filePath = `${userId}/${randomUUID()}.mp3`
-
-  const { error: uploadError } = await supabase.storage
-    .from('audiobooks')
-    .upload(filePath, audioBuffer, { contentType: 'audio/mpeg' })
-
-  if (uploadError) {
-    console.error('Errore upload storage:', uploadError)
-    return c.json({ error: 'Errore nel salvataggio del file audio' }, 500)
-  }
-
-  const { data: inserted, error: insertError } = await supabase
-    .from('audiobooks')
-    .insert({
-      user_id: userId,
-      title,
-      original_text: originalText,
-      voice,
-      audio_path: filePath,
-    })
-    .select()
-    .single()
-
-  if (insertError) {
-    console.error('Errore inserimento libreria:', insertError)
-    // Ripulisce il file caricato se l'inserimento nel database fallisce
-    await supabase.storage.from('audiobooks').remove([filePath])
-    return c.json({ error: 'Errore nel salvataggio in libreria' }, 500)
-  }
-
-  return c.json({ audiobook: inserted }, 201)
 })
-
 
 const port = Number(process.env.PORT) || 3000
 console.log(`🚀 Server avviato su http://localhost:${port}`)
