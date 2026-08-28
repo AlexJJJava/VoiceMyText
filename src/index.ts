@@ -243,7 +243,7 @@ app.post('/library', async (c) => {
     return c.json({ error: 'Errore interno del server' }, 500)
   }
 })
- 
+
 const port = Number(process.env.PORT) || 3000
 console.log(`🚀 Server avviato su http://localhost:${port}`)
 serve({ fetch: app.fetch, port })
