@@ -11,11 +11,15 @@
     "hono": "^4.6.0",
     "@hono/node-server": "^1.13.0",
     "edge-tts-universal": "^1.4.0",
-    "@supabase/supabase-js": "^2.45.0"
+    "@supabase/supabase-js": "^2.45.0",
+    "mammoth": "^1.8.0",
+    "pdf-parse": "^1.1.1",
+    "tesseract.js": "^5.1.1"
   },
   "devDependencies": {
     "typescript": "^5.6.0",
     "tsx": "^4.19.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "@types/pdf-parse": "^1.1.4"
   }
 }

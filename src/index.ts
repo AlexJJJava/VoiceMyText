@@ -4,6 +4,9 @@ import { cors } from 'hono/cors'
 import { Communicate } from 'edge-tts-universal'
 import { createClient } from '@supabase/supabase-js'
 import { randomUUID } from 'node:crypto'
+import mammoth from 'mammoth'
+import pdfParse from 'pdf-parse'
+import { createWorker } from 'tesseract.js'
 
 const app = new Hono()
 
@@ -48,38 +51,48 @@ app.get('/health', (c) => c.json({ status: 'ok' }))
 app.get('/voices', (c) => c.json({ voices: Object.keys(VOICES) }))
 
 // ── Rate limiting semplice, in memoria, per IP ─────────────────────
-// Limite: 5 richieste al minuto per IP sull'endpoint /tts.
 // Adatto a un singolo server; se in futuro si scala su più istanze,
 // va sostituito con uno store condiviso (es. Redis).
-const RATE_LIMIT_MAX = 5
-const RATE_LIMIT_WINDOW_MS = 60_000
+function createRateLimiter(max: number, windowMs: number) {
+  const log = new Map<string, number[]>()
 
-const requestLog = new Map<string, number[]>()
+  return function isLimited(ip: string): boolean {
+    const now = Date.now()
+    const timestamps = log.get(ip) ?? []
 
-function isRateLimited(ip: string): boolean {
-  const now = Date.now()
-  const timestamps = requestLog.get(ip) ?? []
+    // Tiene solo le richieste dentro la finestra temporale corrente
+    const recent = timestamps.filter((t) => now - t < windowMs)
 
-  // Tiene solo le richieste dentro la finestra temporale corrente
-  const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS)
+    if (recent.length >= max) {
+      log.set(ip, recent)
+      return true
+    }
 
-  if (recent.length >= RATE_LIMIT_MAX) {
-    requestLog.set(ip, recent)
-    return true
+    recent.push(now)
+    log.set(ip, recent)
+    return false
   }
-
-  recent.push(now)
-  requestLog.set(ip, recent)
-  return false
 }
 
-app.post('/tts', async (c) => {
-  const ip =
+const RATE_LIMIT_MAX = 5
+const RATE_LIMIT_WINDOW_MS = 60_000
+const isTtsRateLimited = createRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW_MS)
+// Limiter separato per l'estrazione testo (più pesante: OCR/parsing file),
+// così non condivide il budget di richieste con la generazione audio.
+const isExtractRateLimited = createRateLimiter(5, RATE_LIMIT_WINDOW_MS)
+
+function getClientIp(c: { req: { header: (name: string) => string | undefined } }): string {
+  return (
     c.req.header('x-forwarded-for')?.split(',')[0].trim() ??
     c.req.header('x-real-ip') ??
     'unknown'
+  )
+}
 
-  if (isRateLimited(ip)) {
+app.post('/tts', async (c) => {
+  const ip = getClientIp(c)
+
+  if (isTtsRateLimited(ip)) {
     return c.json(
       { error: `Troppe richieste. Massimo ${RATE_LIMIT_MAX} al minuto, riprova tra poco.` },
       429
@@ -153,6 +166,85 @@ app.post('/tts', async (c) => {
 // ── Salvataggio in libreria (max 2 audiolibri per utente) ──────────
 // Riceve l'audio già generato (dall'anteprima /tts) insieme ai metadati,
 // verifica il limite e lo carica su Supabase Storage + database.
+// ── Estrazione testo da file (.docx, .pdf, immagini via OCR) ───────
+// Non richiede autenticazione: è un passaggio preliminare alla
+// generazione audio, non tocca dati dell'utente. Protetto comunque da
+// rate limiting perché più pesante di una normale richiesta.
+const MAX_UPLOAD_BYTES = 15 * 1024 * 1024 // 15 MB
+
+app.post('/extract-text', async (c) => {
+  const ip = getClientIp(c)
+
+  if (isExtractRateLimited(ip)) {
+    return c.json(
+      { error: 'Troppe richieste. Massimo 5 al minuto, riprova tra poco.' },
+      429
+    )
+  }
+
+  const contentLengthHeader = c.req.header('content-length')
+  const contentLength = contentLengthHeader ? parseInt(contentLengthHeader, 10) : 0
+  if (contentLength > MAX_UPLOAD_BYTES) {
+    return c.json({ error: 'File troppo grande (massimo 15MB)' }, 413)
+  }
+
+  try {
+    const body = await c.req.parseBody()
+    const file = body.file
+
+    if (!(file instanceof File)) {
+      return c.json({ error: 'File mancante' }, 400)
+    }
+
+    const buffer = Buffer.from(await file.arrayBuffer())
+    const fileName = file.name.toLowerCase()
+
+    let extractedText = ''
+
+    if (fileName.endsWith('.docx')) {
+      const result = await mammoth.extractRawText({ buffer })
+      extractedText = result.value
+    } else if (fileName.endsWith('.pdf')) {
+      const result = await pdfParse(buffer)
+      extractedText = result.text
+    } else if (/\.(jpe?g|png)$/.test(fileName)) {
+      const worker = await createWorker(['ita', 'eng'])
+      try {
+        const { data } = await worker.recognize(buffer)
+        extractedText = data.text
+      } finally {
+        await worker.terminate()
+      }
+    } else {
+      return c.json(
+        { error: 'Formato non supportato. Usa .docx, .pdf oppure un\'immagine (.jpg, .png).' },
+        400
+      )
+    }
+
+    extractedText = extractedText.trim()
+
+    if (!extractedText) {
+      return c.json(
+        { error: 'Non è stato possibile estrarre testo da questo file. Prova con un file più nitido o leggibile.' },
+        422
+      )
+    }
+
+    if (extractedText.length > 50_000) {
+      extractedText = extractedText.slice(0, 50_000)
+    }
+
+    // Suggerisce un titolo a partire dal nome del file (senza estensione)
+    const suggestedTitle = file.name.replace(/\.[^/.]+$/, '')
+
+    return c.json({ text: extractedText, title: suggestedTitle })
+  } catch (err) {
+    console.error('Errore imprevisto in /extract-text:', err)
+    return c.json({ error: 'Errore durante l\'estrazione del testo dal file' }, 500)
+  }
+})
+
 app.post('/library', async (c) => {
   const authHeader = c.req.header('authorization') ?? c.req.header('Authorization')
   const accessToken = authHeader?.replace(/^Bearer\s+/i, '')
@@ -243,7 +335,7 @@ app.post('/library', async (c) => {
     return c.json({ error: 'Errore interno del server' }, 500)
   }
 })
- 
+
 const port = Number(process.env.PORT) || 3000
 console.log(`🚀 Server avviato su http://localhost:${port}`)
 serve({ fetch: app.fetch, port })
