@@ -172,6 +172,19 @@ app.post('/tts', async (c) => {
 // rate limiting perché più pesante di una normale richiesta.
 const MAX_UPLOAD_BYTES = 15 * 1024 * 1024 // 15 MB
 
+// Il testo estratto da PDF e OCR mantiene gli "a-capo" originali del
+// documento (dettati dall'impaginazione, non dalla fine della frase).
+// Se li lasciamo, il motore TTS li legge come pause innaturali a metà
+// frase. Qui uniamo le righe che appartengono allo stesso paragrafo,
+// mantenendo solo le vere interruzioni (paragrafi separati da riga vuota).
+function normalizeExtractedText(raw: string): string {
+  const paragraphs = raw.split(/\n\s*\n+/)
+  return paragraphs
+    .map((p) => p.replace(/\s*\n\s*/g, ' ').replace(/[ \t]+/g, ' ').trim())
+    .filter((p) => p.length > 0)
+    .join('\n\n')
+}
+
 app.post('/extract-text', async (c) => {
   const ip = getClientIp(c)
 
@@ -206,12 +219,12 @@ app.post('/extract-text', async (c) => {
       extractedText = result.value
     } else if (fileName.endsWith('.pdf')) {
       const result = await pdfParse(buffer)
-      extractedText = result.text
+      extractedText = normalizeExtractedText(result.text)
     } else if (/\.(jpe?g|png)$/.test(fileName)) {
       const worker = await createWorker(['ita', 'eng'])
       try {
         const { data } = await worker.recognize(buffer)
-        extractedText = data.text
+        extractedText = normalizeExtractedText(data.text)
       } finally {
         await worker.terminate()
       }
