@@ -14,7 +14,8 @@
     "@supabase/supabase-js": "^2.45.0",
     "mammoth": "^1.8.0",
     "pdf-parse": "^1.1.1",
-    "tesseract.js": "^5.1.1"
+    "tesseract.js": "^5.1.1",
+    "jszip": "^3.10.1"
   },
   "devDependencies": {
     "typescript": "^5.6.0",
