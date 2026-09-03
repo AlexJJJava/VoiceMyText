@@ -476,7 +476,17 @@ app.post('/extract-text', async (c) => {
     // Suggerisce un titolo a partire dal nome del primo file (senza estensione)
     const suggestedTitle = files[0].name.replace(/\.[^/.]+$/, '')
 
-    return c.json({ pages, title: suggestedTitle })
+    // Rete di sicurezza: garantisce che ogni paragrafo abbia sempre i tipi
+    // attesi (text: string, isHeading: boolean), qualunque cosa accada
+    // nell'estrazione a monte, per evitare risposte malformate al client.
+    const safePages = pages.map((page) =>
+      page.map((p) => ({
+        text: typeof p.text === 'string' ? p.text : String(p.text ?? ''),
+        isHeading: p.isHeading === true,
+      }))
+    )
+
+    return c.json({ pages: safePages, title: suggestedTitle })
   } catch (err) {
     console.error('Errore imprevisto in /extract-text:', err)
     return c.json({ error: 'Errore durante l\'estrazione del testo dal file' }, 500)
