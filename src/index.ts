@@ -186,72 +186,211 @@ function normalizeExtractedText(raw: string): string {
     .join('\n\n')
 }
 
-// Estrae il testo di un PDF pagina per pagina, usando l'hook "pagerender"
-// di pdf-parse per intercettare il contenuto di ogni singola pagina invece
-// di ricevere solo il testo dell'intero documento concatenato.
-async function extractPdfPages(buffer: Buffer): Promise<string[]> {
-  const pageTexts: string[] = []
+// Un paragrafo del documento, con un'indicazione se sembra un titolo di
+// capitolo (usato dal frontend per la preview strutturata).
+interface DocParagraph {
+  text: string
+  isHeading: boolean
+}
+
+// Valore più frequente in un array di numeri (usato per stimare la
+// dimensione del "testo normale" di un documento, contro cui confrontare
+// i titoli).
+function mode(values: number[]): number {
+  if (values.length === 0) return 0
+  const counts = new Map<number, number>()
+  for (const v of values) counts.set(v, (counts.get(v) ?? 0) + 1)
+  let best = values[0]
+  let bestCount = 0
+  for (const [v, c] of counts) {
+    if (c > bestCount) {
+      best = v
+      bestCount = c
+    }
+  }
+  return best
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0
+  const sorted = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+}
+
+// Estrae il PDF pagina per pagina, ricostruendo righe e paragrafi dalla
+// posizione e dimensione reale del testo (disponibile nei PDF, a differenza
+// del testo semplice): una riga corta, con font più grande del normale e
+// preceduta da uno spazio verticale maggiore del solito, viene considerata
+// un titolo di capitolo.
+async function extractPdfStructuredPages(buffer: Buffer): Promise<DocParagraph[][]> {
+  const pages: DocParagraph[][] = []
 
   await pdfParse(buffer, {
     pagerender: async (pageData: {
       pageNumber: number
-      getTextContent: () => Promise<{ items: Array<{ str: string }> }>
+      getTextContent: () => Promise<{
+        items: Array<{ str: string; transform: number[] }>
+      }>
     }) => {
       const content = await pageData.getTextContent()
-      const text = content.items.map((item) => item.str).join(' ')
-      pageTexts[pageData.pageNumber - 1] = text
-      return text
+
+      // Raggruppa gli item di testo in righe, in base alla coordinata Y
+      type Line = { y: number; size: number; text: string }
+      const lines: Line[] = []
+      for (const item of content.items) {
+        const y = item.transform[5]
+        const size =
+          Math.hypot(item.transform[2], item.transform[3]) ||
+          Math.abs(item.transform[3])
+        const last = lines[lines.length - 1]
+        if (last && Math.abs(last.y - y) < 2) {
+          last.text += item.str
+          last.size = Math.max(last.size, size)
+        } else {
+          lines.push({ y, size, text: item.str })
+        }
+      }
+
+      // Dimensione del "corpo del testo": la più frequente tra le righe
+      const bodySize = mode(lines.map((l) => Math.round(l.size)))
+
+      // Spaziatura verticale tipica tra righe consecutive dello stesso
+      // paragrafo, per riconoscere un salto più ampio (= nuovo paragrafo)
+      const gaps: number[] = []
+      for (let i = 1; i < lines.length; i++) {
+        gaps.push(Math.abs(lines[i].y - lines[i - 1].y))
+      }
+      const typicalGap = median(gaps)
+
+      const paragraphs: DocParagraph[] = []
+      let buf = ''
+      let bufIsHeading = false
+
+      for (let i = 0; i < lines.length; i++) {
+        const text = lines[i].text.trim()
+        if (!text) continue
+
+        const gapBefore = i > 0 ? Math.abs(lines[i].y - lines[i - 1].y) : 0
+        const isNewParagraph = i === 0 || gapBefore > typicalGap * 1.6
+
+        if (isNewParagraph) {
+          if (buf.trim()) paragraphs.push({ text: buf.trim(), isHeading: bufIsHeading })
+          const wordCount = text.split(/\s+/).length
+          bufIsHeading =
+            typicalGap > 0 &&
+            Math.round(lines[i].size) > bodySize * 1.15 &&
+            wordCount <= 12
+          buf = text
+        } else {
+          buf += ' ' + text
+        }
+      }
+      if (buf.trim()) paragraphs.push({ text: buf.trim(), isHeading: bufIsHeading })
+
+      pages[pageData.pageNumber - 1] = paragraphs
+      return paragraphs.map((p) => p.text).join('\n\n')
     },
   })
 
-  return pageTexts.map((t) => normalizeExtractedText(t ?? ''))
+  return pages.map((p) => p ?? [])
+}
+
+// Analizza un blocco XML di un documento .docx (o un intero documento) e
+// ne estrae i paragrafi, rilevando i titoli tramite lo stile Word
+// ("Heading"/"Titolo") o una dimensione del font maggiore del normale.
+function parseDocxParagraphs(segmentXml: string): DocParagraph[] {
+  const paraMatches = [...segmentXml.matchAll(/<w:p\b[^>]*>([\s\S]*?)<\/w:p>/g)]
+  const raw: { text: string; sz: number; styleHeading: boolean }[] = []
+
+  for (const pm of paraMatches) {
+    const pXml = pm[1]
+    const textMatches = [...pXml.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)]
+    const text = textMatches.map((m) => m[1]).join('').trim()
+    if (!text) continue
+
+    const styleMatch = pXml.match(/<w:pStyle w:val="([^"]+)"/)
+    const styleHeading = !!styleMatch && /heading|title|titolo/i.test(styleMatch[1])
+
+    const szMatches = [...pXml.matchAll(/<w:sz w:val="(\d+)"/g)].map((m) =>
+      parseInt(m[1], 10)
+    )
+    const maxSz = szMatches.length ? Math.max(...szMatches) : 0
+
+    raw.push({ text, sz: maxSz, styleHeading })
+  }
+
+  const bodySize = mode(raw.filter((p) => !p.styleHeading && p.sz > 0).map((p) => p.sz)) || 22
+
+  return raw.map((p) => {
+    const wordCount = p.text.split(/\s+/).length
+    const isHeading = p.styleHeading || (p.sz > bodySize * 1.15 && wordCount <= 12)
+    return { text: p.text, isHeading }
+  })
 }
 
 // I file .docx non contengono numeri di pagina reali (dipendono da come
 // verrà stampato/visualizzato), a meno che l'autore non abbia inserito
 // interruzioni di pagina esplicite. Qui leggiamo l'XML interno del docx
-// (è uno zip) e dividiamo il testo su quelle interruzioni, se presenti.
-// Se non ce ne sono, restituiamo l'intero documento come unica "pagina".
-async function extractDocxPages(buffer: Buffer): Promise<string[]> {
+// (è uno zip) e dividiamo su quelle interruzioni, se presenti; altrimenti
+// il documento intero è considerato un'unica "pagina".
+async function extractDocxStructuredPages(buffer: Buffer): Promise<DocParagraph[][]> {
   try {
     const zip = await JSZip.loadAsync(buffer)
     const xml = await zip.file('word/document.xml')?.async('string')
 
     if (xml) {
       const segments = xml.split(/<w:br[^>]*w:type="page"[^>]*\/?>/g)
-      if (segments.length > 1) {
-        const pages = segments
-          .map((segment) => {
-            const matches = [...segment.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)]
-            const rawText = matches.map((m) => m[1]).join(' ')
-            return normalizeExtractedText(rawText)
-          })
-          .filter((p) => p.length > 0)
-        if (pages.length > 1) return pages
-      }
+      const pages = segments.map(parseDocxParagraphs).filter((p) => p.length > 0)
+      if (pages.length > 0) return pages
     }
   } catch (err) {
-    console.error('Errore lettura interruzioni di pagina docx:', err)
+    console.error('Errore lettura struttura docx:', err)
     // Ricade sull'estrazione semplice con mammoth qui sotto
   }
 
-  // Nessuna interruzione di pagina esplicita trovata: documento intero
-  // come unica pagina, tramite l'estrazione standard (più affidabile).
   const result = await mammoth.extractRawText({ buffer })
-  return [normalizeExtractedText(result.value)]
+  const text = normalizeExtractedText(result.value)
+  return [text.split('\n\n').filter((p) => p.trim()).map((t) => ({ text: t, isHeading: false }))]
 }
 
 // Esegue l'OCR su una o più immagini, una per pagina, nell'ordine in cui
-// sono state caricate.
-async function extractImagePages(files: File[]): Promise<string[]> {
+// sono state caricate. L'OCR non fornisce informazioni affidabili sulla
+// dimensione del font, quindi qui i titoli vengono riconosciuti solo con
+// un'euristica testuale: un paragrafo composto da una singola riga breve,
+// senza punteggiatura di fine frase.
+async function extractImageStructuredPages(files: File[]): Promise<DocParagraph[][]> {
   const worker = await createWorker(['ita', 'eng'])
   try {
-    const pages: string[] = []
+    const pages: DocParagraph[][] = []
+
     for (const file of files) {
       const buffer = Buffer.from(await file.arrayBuffer())
       const { data } = await worker.recognize(buffer)
-      pages.push(normalizeExtractedText(data.text))
+
+      const ocrParagraphs = (
+        (data as unknown as {
+          paragraphs?: Array<{ text: string; lines?: unknown[] }>
+        }).paragraphs ?? []
+      )
+        .map((p) => {
+          const text = normalizeExtractedText(p.text ?? '')
+          const wordCount = text.split(/\s+/).filter(Boolean).length
+          const lineCount = p.lines?.length ?? 1
+          const isHeading =
+            lineCount <= 1 && wordCount > 0 && wordCount <= 8 && !/[.,;:]$/.test(text.trim())
+          return { text, isHeading }
+        })
+        .filter((p) => p.text.length > 0)
+
+      if (ocrParagraphs.length > 0) {
+        pages.push(ocrParagraphs)
+      } else {
+        const text = normalizeExtractedText(data.text)
+        if (text) pages.push([{ text, isHeading: false }])
+      }
     }
+
     return pages
   } finally {
     await worker.terminate()
@@ -291,14 +430,14 @@ app.post('/extract-text', async (c) => {
     const firstName = files[0].name.toLowerCase()
     const allImages = files.every((f) => /\.(jpe?g|png)$/.test(f.name.toLowerCase()))
 
-    let pages: string[]
+    let pages: DocParagraph[][]
 
     if (files.length === 1 && firstName.endsWith('.docx')) {
-      pages = await extractDocxPages(Buffer.from(await files[0].arrayBuffer()))
+      pages = await extractDocxStructuredPages(Buffer.from(await files[0].arrayBuffer()))
     } else if (files.length === 1 && firstName.endsWith('.pdf')) {
-      pages = await extractPdfPages(Buffer.from(await files[0].arrayBuffer()))
+      pages = await extractPdfStructuredPages(Buffer.from(await files[0].arrayBuffer()))
     } else if (allImages) {
-      pages = await extractImagePages(files)
+      pages = await extractImageStructuredPages(files)
     } else {
       return c.json(
         {
@@ -309,7 +448,9 @@ app.post('/extract-text', async (c) => {
       )
     }
 
-    pages = pages.filter((p) => p.trim().length > 0)
+    pages = pages
+      .map((page) => page.filter((p) => p.text.trim().length > 0))
+      .filter((page) => page.length > 0)
 
     if (pages.length === 0) {
       return c.json(
@@ -318,9 +459,19 @@ app.post('/extract-text', async (c) => {
       )
     }
 
-    // Limite di sicurezza per singola pagina (l'utente sceglierà poi
-    // l'intervallo da usare, ma evitiamo comunque pagine abnormi)
-    pages = pages.map((p) => (p.length > 50_000 ? p.slice(0, 50_000) : p))
+    // Limite di sicurezza per pagina (somma dei caratteri dei paragrafi):
+    // l'utente sceglierà poi l'intervallo da usare, ma evitiamo comunque
+    // di restituire pagine abnormemente lunghe.
+    pages = pages.map((page) => {
+      let total = 0
+      const capped: DocParagraph[] = []
+      for (const p of page) {
+        if (total + p.text.length > 50_000) break
+        capped.push(p)
+        total += p.text.length
+      }
+      return capped
+    })
 
     // Suggerisce un titolo a partire dal nome del primo file (senza estensione)
     const suggestedTitle = files[0].name.replace(/\.[^/.]+$/, '')
